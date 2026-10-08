@@ -1,0 +1,315 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "TERRALINKPRO shared enquiries and private admin dashboard",
+  "Parameters": {
+    "SiteOrigin": {
+      "Type": "String",
+      "Default": "https://www.terralinkpro.net",
+      "AllowedPattern": "https://[^/]+",
+      "Description": "Exact website origin, without trailing slash"
+    }
+  },
+  "Resources": {
+    "Table": {
+      "Type": "AWS::DynamoDB::Table",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "id",
+            "AttributeType": "S"
+          }
+        ],
+        "KeySchema": [
+          {
+            "AttributeName": "id",
+            "KeyType": "HASH"
+          }
+        ],
+        "SSESpecification": {
+          "SSEEnabled": true
+        },
+        "PointInTimeRecoverySpecification": {
+          "PointInTimeRecoveryEnabled": true
+        }
+      }
+    },
+    "Pool": {
+      "Type": "AWS::Cognito::UserPool",
+      "Properties": {
+        "UserPoolName": {
+          "Fn::Sub": "${AWS::StackName}-admins"
+        },
+        "AdminCreateUserConfig": {
+          "AllowAdminCreateUserOnly": true
+        },
+        "UsernameAttributes": [
+          "email"
+        ],
+        "AutoVerifiedAttributes": [
+          "email"
+        ],
+        "Policies": {
+          "PasswordPolicy": {
+            "MinimumLength": 12,
+            "RequireLowercase": true,
+            "RequireUppercase": true,
+            "RequireNumbers": true,
+            "RequireSymbols": true
+          }
+        },
+        "Schema": [
+          {
+            "Name": "email",
+            "Required": true,
+            "Mutable": true
+          }
+        ]
+      }
+    },
+    "Client": {
+      "Type": "AWS::Cognito::UserPoolClient",
+      "Properties": {
+        "UserPoolId": {
+          "Ref": "Pool"
+        },
+        "GenerateSecret": false,
+        "ExplicitAuthFlows": [
+          "ALLOW_USER_PASSWORD_AUTH",
+          "ALLOW_REFRESH_TOKEN_AUTH"
+        ],
+        "PreventUserExistenceErrors": "ENABLED",
+        "AccessTokenValidity": 1,
+        "IdTokenValidity": 1,
+        "TokenValidityUnits": {
+          "AccessToken": "hours",
+          "IdToken": "hours"
+        }
+      }
+    },
+    "Role": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+          }
+        ],
+        "Policies": [
+          {
+            "PolicyName": "ReferralRecords",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "dynamodb:PutItem",
+                    "dynamodb:Scan"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "Table",
+                      "Arn"
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "Function": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "Runtime": "nodejs22.x",
+        "Handler": "index.handler",
+        "Timeout": 15,
+        "MemorySize": 128,
+        "Role": {
+          "Fn::GetAtt": [
+            "Role",
+            "Arn"
+          ]
+        },
+        "Environment": {
+          "Variables": {
+            "TABLE": {
+              "Ref": "Table"
+            },
+            "CLIENT_ID": {
+              "Ref": "Client"
+            }
+          }
+        },
+        "Code": {
+          "ZipFile": "const { DynamoDBClient, PutItemCommand, ScanCommand } = require('@aws-sdk/client-dynamodb');\nconst { randomUUID } = require('node:crypto');\nconst db = new DynamoDBClient({});\nconst reply = (statusCode, body) => ({ statusCode, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }, body: JSON.stringify(body) });\nexports.handler = async event => {\n  try {\n    if (event.routeKey === 'POST /enquiries') {\n      const raw = event.isBase64Encoded ? Buffer.from(event.body || '', 'base64').toString() : event.body || '';\n      if (Buffer.byteLength(raw) > 12000) return reply(413, { error: 'Enquiry too large' });\n      let data; try { data = JSON.parse(raw); } catch { return reply(400, { error: 'Invalid request' }); }\n      if (!data || typeof data !== 'object') return reply(400, { error: 'Invalid request' });\n      if (data.website) return reply(400, { error: 'Invalid request' });\n      const value = key => typeof data[key] === 'string' ? data[key].trim() : '';\n      const name = value('name'), email = value('email'), message = value('message'), referral = value('referral').toUpperCase();\n      if (!name || name.length > 100 || !/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email) || email.length > 254 || !message || message.length > 2000 || (referral && !/^[A-Z0-9][A-Z0-9_-]{2,31}$/.test(referral))) return reply(400, { error: 'Invalid enquiry fields' });\n      const id = /^[0-9a-f-]{36}$/i.test(value('id')) ? value('id') : randomUUID();\n      const record = { id, createdAt: new Date().toISOString(), name, email, message, referral };\n      try { await db.send(new PutItemCommand({ TableName: process.env.TABLE, Item: Object.fromEntries(Object.entries(record).map(([key,val])=>[key,{S:val}])), ConditionExpression: 'attribute_not_exists(id)' })); }\n      catch (err) { if (err.name !== 'ConditionalCheckFailedException') throw err; }\n      return reply(201, { id });\n    }\n    if (event.routeKey === 'GET /enquiries') {\n      // Defense in depth: only access tokens for the dedicated, invitation-only pool/client.\n      const claims = event.requestContext?.authorizer?.jwt?.claims;\n      if (claims?.token_use !== 'access' || claims?.client_id !== process.env.CLIENT_ID) return reply(403, { error: 'Forbidden' });\n      let start;\n      const cursor = event.queryStringParameters?.cursor;\n      if (cursor) {\n        try { const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString()); if (typeof parsed.id?.S !== 'string' || parsed.id.S.length > 100) throw Error(); start = { id: { S: parsed.id.S } }; }\n        catch { return reply(400, { error: 'Invalid cursor' }); }\n      }\n      const result = await db.send(new ScanCommand({ TableName: process.env.TABLE, Limit: 100, ExclusiveStartKey: start }));\n      const items = (result.Items || []).map(item=>Object.fromEntries(Object.entries(item).map(([key,val])=>[key,val.S]))).sort((a,b)=>b.createdAt.localeCompare(a.createdAt));\n      return reply(200, { items, cursor: result.LastEvaluatedKey ? Buffer.from(JSON.stringify(result.LastEvaluatedKey)).toString('base64url') : null });\n    }\n    return reply(404, { error: 'Not found' });\n  } catch { return reply(500, { error: 'Service unavailable. Please retry.' }); }\n};\n"
+        }
+      }
+    },
+    "Api": {
+      "Type": "AWS::ApiGatewayV2::Api",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${AWS::StackName}-api"
+        },
+        "ProtocolType": "HTTP",
+        "CorsConfiguration": {
+          "AllowOrigins": [
+            {
+              "Ref": "SiteOrigin"
+            }
+          ],
+          "AllowMethods": [
+            "GET",
+            "POST",
+            "OPTIONS"
+          ],
+          "AllowHeaders": [
+            "content-type",
+            "authorization"
+          ],
+          "MaxAge": 600
+        }
+      }
+    },
+    "Integration": {
+      "Type": "AWS::ApiGatewayV2::Integration",
+      "Properties": {
+        "ApiId": {
+          "Ref": "Api"
+        },
+        "IntegrationType": "AWS_PROXY",
+        "IntegrationUri": {
+          "Fn::GetAtt": [
+            "Function",
+            "Arn"
+          ]
+        },
+        "PayloadFormatVersion": "2.0"
+      }
+    },
+    "Authorizer": {
+      "Type": "AWS::ApiGatewayV2::Authorizer",
+      "Properties": {
+        "ApiId": {
+          "Ref": "Api"
+        },
+        "AuthorizerType": "JWT",
+        "IdentitySource": [
+          "$request.header.Authorization"
+        ],
+        "Name": "AdminCognito",
+        "JwtConfiguration": {
+          "Audience": [
+            {
+              "Ref": "Client"
+            }
+          ],
+          "Issuer": {
+            "Fn::Sub": "https://cognito-idp.${AWS::Region}.amazonaws.com/${Pool}"
+          }
+        }
+      }
+    },
+    "CreateRoute": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Properties": {
+        "ApiId": {
+          "Ref": "Api"
+        },
+        "RouteKey": "POST /enquiries",
+        "AuthorizationType": "NONE",
+        "Target": {
+          "Fn::Sub": "integrations/${Integration}"
+        }
+      }
+    },
+    "ListRoute": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Properties": {
+        "ApiId": {
+          "Ref": "Api"
+        },
+        "RouteKey": "GET /enquiries",
+        "AuthorizationType": "JWT",
+        "AuthorizerId": {
+          "Ref": "Authorizer"
+        },
+        "AuthorizationScopes": [
+          "aws.cognito.signin.user.admin"
+        ],
+        "Target": {
+          "Fn::Sub": "integrations/${Integration}"
+        }
+      }
+    },
+    "Stage": {
+      "Type": "AWS::ApiGatewayV2::Stage",
+      "Properties": {
+        "ApiId": {
+          "Ref": "Api"
+        },
+        "StageName": "$default",
+        "AutoDeploy": true,
+        "DefaultRouteSettings": {
+          "ThrottlingBurstLimit": 10,
+          "ThrottlingRateLimit": 5
+        }
+      }
+    },
+    "Permission": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "Function"
+        },
+        "Principal": "apigateway.amazonaws.com",
+        "SourceArn": {
+          "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*"
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "ApiUrl": {
+      "Value": {
+        "Fn::GetAtt": [
+          "Api",
+          "ApiEndpoint"
+        ]
+      }
+    },
+    "Region": {
+      "Value": {
+        "Ref": "AWS::Region"
+      }
+    },
+    "UserPoolId": {
+      "Value": {
+        "Ref": "Pool"
+      }
+    },
+    "ClientId": {
+      "Value": {
+        "Ref": "Client"
+      }
+    }
+  }
+}
